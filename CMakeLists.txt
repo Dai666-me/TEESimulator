@@ -230,3 +230,24 @@ target_link_options(teesim_keystore PRIVATE
     -Wl,-z,undefs
     -Wl,--version-script=${CMAKE_SOURCE_DIR}/keymint/exports.map
     -Wl,--gc-sections)
+
+# --- Soter software backend interceptor ------------------------------------
+add_library(teesim_soter SHARED
+    soter/entry.cpp
+    soter/hook.cpp
+    soter/backend.cpp
+    soter/storage.cpp
+    soter/session.cpp
+    )
+target_include_directories(teesim_soter PRIVATE
+    soter
+    injector/include
+    common
+)
+target_link_libraries(teesim_soter PRIVATE
+    lsplt ${CRYPTO_LINK} log
+)
+target_link_options(teesim_soter PRIVATE
+    -static-libstdc++
+    -Wl,-z,undefs
+    -Wl,--gc-sections)
