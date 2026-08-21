@@ -79,6 +79,7 @@ void setup_arm_args(struct user_regs_struct &regs, const std::vector<uintptr_t> 
 
 bool switch_mnt_ns(int pid, int *fd) {
     if (pid == 0) {
+        // 恢复命名空间（不变）
         if (!fd || *fd == kInvalidFd) {
             LOGE("Invalid file descriptor for namespace switch (restore operation).");
             return false;
@@ -92,30 +93,38 @@ bool switch_mnt_ns(int pid, int *fd) {
         LOGD("Successfully switched back to original namespace (FD: %d).", nsfd.operator const int &());
         return true;
     } else {
-        UniqueFd old_nsfd;
+        // 切换到目标 PID 的命名空间
+        int old_nsfd = kInvalidFd;
+
         if (fd) {
-            int raw_fd = open("/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
-            if (raw_fd == kInvalidFd) {
+            old_nsfd = open("/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
+            if (old_nsfd == kInvalidFd) {
                 PLOGE("Failed to open current mount namespace for backup.");
                 return false;
             }
-            old_nsfd.reset(raw_fd);
         }
 
         std::string target_path = "/proc/" + std::to_string(pid) + "/ns/mnt";
         UniqueFd target_nsfd = open(target_path.c_str(), O_RDONLY | O_CLOEXEC);
         if (target_nsfd == kInvalidFd) {
             PLOGE("Failed to open target PID %d's mount namespace: %s", pid, target_path.c_str());
+            if (old_nsfd != kInvalidFd) {
+                close(old_nsfd);
+            }
             return false;
         }
 
         if (setns(target_nsfd, CLONE_NEWNS) == -1) {
             PLOGE("Failed to switch to target PID %d's mount namespace: %s", pid, target_path.c_str());
+            if (old_nsfd != kInvalidFd) {
+                close(old_nsfd);
+            }
             return false;
         }
 
         if (fd) {
-            *fd = old_nsfd.release();
+            *fd = old_nsfd;               // 转移所有权
+            old_nsfd = kInvalidFd;        // 防止重复 close
             LOGV("Backup namespace FD %d stored for later restore.", *fd);
         }
 
