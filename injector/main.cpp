@@ -369,7 +369,7 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
     // 3) 设置远端 msghdr，包含 iovec 和 cmsg
     // 3) Set up the remote msghdr with iovec and cmsg.
     struct msghdr msg_hdr{};
-    msg_hdr.msg_iov = reinterpret_cast<void *>(remote_iov_addr);
+    msg_hdr.msg_iov = reinterpret_cast<struct iovec *>(remote_iov_addr);
     msg_hdr.msg_iovlen = 1;
     msg_hdr.msg_control = reinterpret_cast<void *>(remote_cmsgbuf);
     msg_hdr.msg_controllen = sizeof(cmsgbuf);
