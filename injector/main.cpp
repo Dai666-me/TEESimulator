@@ -293,10 +293,9 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
     std::vector<uintptr_t> args = {AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0};
     int remote_fd = static_cast<int>(
         remote_call(pid, regs, reinterpret_cast<uintptr_t>(funcs.socket_addr), libc_return_addr, args));
-    if (remote_fd <= 0) {
-        // remote_call returns 0 on failure.
-        // socket() returning 0 is technically possible (if stdin closed),
-        // but highly unlikely for a daemon. We treat 0 as failure here to catch the injection error.
+    // === FIX: remote_fd 0 is a valid file descriptor, so only treat < 0 as error ===
+    // socket() returns -1 on error, 0 is a valid FD (if stdin was closed).
+    if (remote_fd < 0) {
         errno = get_remote_errno(); // Set local errno for PLOGE.
         PLOGE("Failed to create remote socket (returned %d).", remote_fd);
         return std::nullopt;
@@ -329,10 +328,37 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
     }
     LOGD("Remote socket bound to path: %s", magic.c_str());
 
-    // Prepare control message buffer for SCM_RIGHTS (file descriptor passing).
-    char cmsgbuf[CMSG_SPACE(sizeof(int))] = {0};
+    // ===== 修复 / FIX: 为 recvmsg/sendmsg 添加有效的 iovec (payload) =====
+    // 根据 Linux SCM_RIGHTS 规范，必须至少传输一个数据字节，否则 ancillary data 可能不被正确处理。
+    // According to Linux SCM_RIGHTS specification, at least one data byte must be transferred,
+    // otherwise ancillary data may not be processed correctly.
 
-    // Push the control message buffer to the remote process's stack.
+    // 1) 在远端准备一个字节的 payload 缓冲区
+    // 1) Prepare a one-byte payload buffer in the remote process.
+    uint8_t remote_payload = 0;
+    auto remote_payload_addr = push_memory(pid, regs, &remote_payload, sizeof(remote_payload));
+    if (remote_payload_addr == 0) {
+        LOGE("Failed to push recvmsg payload buffer.");
+        close_remote(remote_fd);
+        return std::nullopt;
+    }
+
+    // 2) 在远端构造 iovec，指向该 payload
+    // 2) Construct an iovec in the remote process pointing to the payload.
+    struct iovec remote_iov {
+        .iov_base = reinterpret_cast<void *>(remote_payload_addr),
+        .iov_len = sizeof(remote_payload)
+    };
+    auto remote_iov_addr = push_memory(pid, regs, &remote_iov, sizeof(remote_iov));
+    if (remote_iov_addr == 0) {
+        LOGE("Failed to push recvmsg iovec.");
+        close_remote(remote_fd);
+        return std::nullopt;
+    }
+
+    // 原有的 cmsg 缓冲保留
+    // Original cmsg buffer remains.
+    char cmsgbuf[CMSG_SPACE(sizeof(int))] = {0};
     auto remote_cmsgbuf = push_memory(pid, regs, &cmsgbuf, sizeof(cmsgbuf));
     if (remote_cmsgbuf == 0) {
         LOGE("Failed to push control message buffer to remote memory.");
@@ -340,8 +366,11 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
         return std::nullopt;
     }
 
-    // Prepare msghdr structure for recvmsg call.
+    // 3) 设置远端 msghdr，包含 iovec 和 cmsg
+    // 3) Set up the remote msghdr with iovec and cmsg.
     struct msghdr msg_hdr{};
+    msg_hdr.msg_iov = reinterpret_cast<void *>(remote_iov_addr);
+    msg_hdr.msg_iovlen = 1;
     msg_hdr.msg_control = reinterpret_cast<void *>(remote_cmsgbuf);
     msg_hdr.msg_controllen = sizeof(cmsgbuf);
 
@@ -354,7 +383,8 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
     }
 
     // Initiate the remote recvmsg call. This will block the remote process.
-    args = {static_cast<uintptr_t>(remote_fd), remote_hdr, MSG_WAITALL};
+    // === MODIFIED: removed MSG_WAITALL to avoid unnecessary blocking ===
+    args = {static_cast<uintptr_t>(remote_fd), remote_hdr, 0};
     if (!remote_pre_call(pid, regs, reinterpret_cast<uintptr_t>(funcs.recvmsg_addr), libc_return_addr, args)) {
         LOGE("Failed to initiate remote recvmsg call.");
         close_remote(remote_fd);
@@ -362,9 +392,20 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
     }
     LOGD("Remote recvmsg initiated, waiting for FD transfer...");
 
-    // Prepare the local msghdr for sending the file descriptor.
-    // The msg_control and msg_name fields of the local msghdr are set up.
-    msg_hdr.msg_control = &cmsgbuf; // Use local cmsgbuf for sending.
+    // ===== 本地 sendmsg 也需补齐 payload =====
+    // ===== Local sendmsg also needs a payload =====
+    uint8_t local_payload = 0;
+    struct iovec local_iov {
+        .iov_base = &local_payload,
+        .iov_len = sizeof(local_payload)
+    };
+
+    // 准备本地 msghdr，使用相同的 cmsgbuf 但此时作为发送缓冲
+    // Prepare local msghdr, using the same cmsgbuf but now as send buffer.
+    msg_hdr.msg_iov = &local_iov;
+    msg_hdr.msg_iovlen = 1;
+    msg_hdr.msg_control = &cmsgbuf;          // Use local cmsgbuf for sending.
+    msg_hdr.msg_controllen = sizeof(cmsgbuf);
     msg_hdr.msg_name = &sock_addr;
     msg_hdr.msg_namelen = addr_len;
 
@@ -505,20 +546,16 @@ static std::optional<uintptr_t> remote_dlopen(int pid, struct user_regs_struct &
                                               const char *lib_path, uintptr_t libc_return_addr) {
     LOGD("Attempting remote dlopen for library: %s with FD: %d", lib_path, lib_fd);
 
+    // === FIX: 移除错误的普通 dlopen fallback ===
+    // 原代码在 android_dlopen_ext 未找到时 fallback 到普通 dlopen，
+    // 但仍传递了三个参数（含 extinfo），导致 ABI 错误。
+    // 现在直接要求 android_dlopen_ext，如果不存在则返回失败，
+    // 让外层 staging fallback 处理。
     auto dlopen_addr = find_func_addr(local_map, remote_map, constants::kLibdlModule, "android_dlopen_ext");
     if (!dlopen_addr) {
-        LOGE("Failed to find 'android_dlopen_ext' in remote '%s'.", constants::kLibdlModule);
-        // Fallback to 'dlopen' if 'android_dlopen_ext' is not found.
-        // This is a common pattern for broader compatibility.
-        dlopen_addr = find_func_addr(local_map, remote_map, constants::kLibdlModule, "dlopen");
-        if (!dlopen_addr) {
-            LOGE("Failed to find 'dlopen' in remote '%s' either. Cannot load library.", constants::kLibdlModule);
-            return std::nullopt;
-        }
-        LOGW("Using 'dlopen' as 'android_dlopen_ext' was not found. FD passing might not be supported.");
-        // If falling back to dlopen, FD passing is not directly supported, and `dlext_info` becomes irrelevant.
-        //
-        // In this case, `lib_path` would need to be a valid path accessible to the target process.
+        LOGE("Failed to find 'android_dlopen_ext' in remote '%s'. FD-based loading is not supported.",
+             constants::kLibdlModule);
+        return std::nullopt;
     }
 
     // Setup android_dlextinfo structure to pass the file descriptor.
@@ -622,10 +659,19 @@ static bool remote_call_entry(int pid, struct user_regs_struct &regs, uintptr_t 
     std::vector<uintptr_t> args = {remote_handle};
     uintptr_t result = remote_call(pid, regs, entry_addr, libc_return_addr, args);
 
-    // The return value of the entry point is logged, but not necessarily checked for success.
-    // The interpretation of the return value depends on the injected library's contract.
+    // === MODIFIED: 改进返回值判断 ===
+    // remote_call() returns 0 on error, but entry function may legitimately return 0.
+    // Since we cannot distinguish, we treat any non-zero return as success,
+    // but log a warning if result == 0. In practice, if the entry function returns 0,
+    // it will be considered a failure, which is a known limitation.
+    if (result == 0) {
+        LOGW("Remote entry point returned 0, which may indicate either successful execution "
+             "with return value 0 or a failure. Assuming failure for safety.");
+        return false;
+    }
+
     LOGI("Remote entry point call completed. Return value: %p", reinterpret_cast<void *>(result));
-    return true; // Return true if the call itself completed, regardless of its return value.
+    return true;
 }
 
 /**
@@ -663,19 +709,41 @@ private:
  */
 static bool copy_file(const char* src, const char* dst) {
     std::ifstream src_file(src, std::ios::binary);
-    std::ofstream dst_file(dst, std::ios::binary);
-
     if (!src_file) {
         PLOGE("Failed to open source file for copying: %s", src);
         return false;
     }
+
+    std::ofstream dst_file(dst, std::ios::binary | std::ios::trunc);
     if (!dst_file) {
         PLOGE("Failed to open destination file for copying: %s", dst);
         return false;
     }
 
     dst_file << src_file.rdbuf();
-    return src_file.good() && dst_file.good();
+
+    // === FIX: 检查写入和刷新状态，而不是使用 src_file.good() ===
+    // 原代码使用 src_file.good() && dst_file.good()，但 src_file 读取到 EOF 后 good() 返回 false，
+    // 导致复制成功但函数返回 false。现在改为检查 dst_file 的写入和刷新状态。
+    // Also check for read errors from source (not EOF).
+    if (!src_file.eof() && src_file.fail()) {
+        PLOGE("Failed while reading source file '%s' during copying.", src);
+        return false;
+    }
+
+    if (!dst_file.good()) {
+        PLOGE("Failed while writing to destination file '%s' during copying.", dst);
+        return false;
+    }
+
+    dst_file.flush();
+
+    if (!dst_file.good()) {
+        PLOGE("Failed to flush staged file '%s'.", dst);
+        return false;
+    }
+
+    return true;
 }
 
 /**
@@ -685,6 +753,9 @@ static bool copy_file(const char* src, const char* dst) {
  * 1. Copies the library to a world-readable location (/data/local/tmp).
  * 2. Loads it via standard dlopen().
  * 3. Immediately deletes the file to hide tracks.
+ *
+ * 注意：/data/local/tmp 路径可能对某些目标进程（如 system/vendor 服务）不可见，
+ * 这可能导致 staging 失败。未来可考虑根据目标进程的 mount namespace 选择合适的路径。
  *
  * @param pid The target process ID.
  * @param regs The target process registers (must be Red-Zone adjusted if x86_64).
@@ -737,7 +808,8 @@ static std::optional<uintptr_t> inject_via_staging(int pid, struct user_regs_str
         return std::nullopt;
     }
 
-    // Call dlopen(path, RTLD_NOW)
+    // Call dlopen(path, RTLD_NOW)  —— 普通 dlopen 只接受两个参数
+    // Call dlopen(path, RTLD_NOW)  —— plain dlopen takes exactly two arguments.
     std::vector<uintptr_t> args = {remote_path_addr, RTLD_NOW};
     uintptr_t handle = remote_call(pid, regs, reinterpret_cast<uintptr_t>(dlopen_addr),
                                    libc_return_addr, args);
@@ -924,11 +996,18 @@ bool inject_library(int pid, const char *lib_path, const char *entry_name) {
         if (!handle_opt || *handle_opt == 0) {
             LOGE("Failed to load library '%s' in remote process %d.", lib_path, pid);
             // If dlopen fails, the remote_lib_guard.fd() is still valid in the target process and needs to be closed.
-            // The RemoteLibraryHandle constructor takes care of this.
+            // The RemoteLibraryHandle destructor will close it.
             return false;
         }
         uintptr_t handle = *handle_opt;
         if (remote_lib_guard) remote_lib_guard->set_handle(handle);
+
+        // === MODIFIED: Re-scan remote maps after successful dlopen to get updated mappings ===
+        // This ensures that subsequent dlsym uses the correct library location,
+        // especially if loading via FD caused additional mappings.
+        LOGD("Re-scanning remote memory maps after loading library...");
+        remote_map = lsplt::MapInfo::Scan(std::to_string(pid));
+        LOGD("Remote maps re-scanned.");
 
         // 8. Find the entry point symbol in the remotely loaded library.
         auto entry_opt = remote_find_entry(pid, current_regs, entry_name, local_map, remote_map,
